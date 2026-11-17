@@ -240,18 +240,16 @@ test("每日积分：完整成功链的 endpoint / body / 顺序正确，到账�
       calls.map(({ url, init }) => `${init.method} ${new URL(url).pathname}`),
       [
         `GET ${BAIZHI.walletBalancePath}`,
-        "POST /api/v1/public/captcha/challenge",
-        "POST /api/v1/public/captcha/redeem",
         `POST ${DAILY_CREDIT_PATH}`,
         `GET ${BAIZHI.walletBalancePath}`,
       ],
     )
-    assert.deepEqual(JSON.parse(calls[1].init.body), {})
-    const redeem = JSON.parse(calls[2].init.body)
-    assert.equal(redeem.token, "challenge-token")
-    assert.ok(Array.isArray(redeem.solutions) && redeem.solutions.length === 1)
-    assert.ok(redeem.solutions.every((solution) => Number.isInteger(solution) && solution >= 0))
-    assert.deepEqual(JSON.parse(calls[3].init.body), { captcha_token: "captcha-token" })
+    // 领取请求带加密的 interaction，不再走 challenge/redeem/captcha_token。
+    const body = JSON.parse(calls[1].init.body)
+    assert.equal(body.interaction.version, 1)
+    assert.match(body.interaction.iv, /^[A-Za-z0-9+/]+={0,2}$/)
+    assert.match(body.interaction.data, /^[A-Za-z0-9+/]+={0,2}$/)
+    assert.equal(body.captcha_token, undefined)
   })
 })
 
@@ -260,7 +258,7 @@ test("每日积分：领取响应 claimed=false 是并发幂等已领取，check
   await withFetch(claimChainHandler({ claimed: false }), async (calls) => {
     const outcome = await plugin.auth.checkin(async () => sessionAuth())
     assert.deepEqual(outcome, { outcome: "claimed", message: "今日已领取" })
-    assert.equal(calls.length, 4, "claimed=false 不再复读钱包，也不能当成失败重发")
+    assert.equal(calls.length, 2, "claimed=false 直接回 already-claimed，不复读钱包也不重发")
     assert.equal(calls.filter((call) => new URL(call.url).pathname === DAILY_CREDIT_PATH).length, 1)
   })
 })
@@ -282,24 +280,24 @@ test("每日积分：领取前钱包失败则 failed 且 0 POST", async () => {
   )
 })
 
-test("每日积分：坏 challenge 映射 captcha，绝不进入 redeem / 领取 POST", async () => {
+test("每日积分：上游要求图片验证码时如实报 captcha，不让卡片假绿", async () => {
   const plugin = await makeBaizhiPlugin()({ client: {} })
   await withFetch(
     (url) => {
       const path = new URL(url).pathname
       if (path === BAIZHI.walletBalancePath) return walletResponse()
-      if (path === "/api/v1/public/captcha/challenge") {
-        return Response.json({ code: 0, data: { token: "bad-challenge", challenge: { c: 0, s: 1, d: 1 } } })
+      if (path === DAILY_CREDIT_PATH) {
+        return Response.json({ code: 0, data: { claimed: false, captcha_required: true, captcha: {} } })
       }
-      throw new Error(`坏 challenge 之后不许请求 ${url}`)
+      throw new Error(`captcha_required 之后不许请求 ${url}`)
     },
     async (calls) => {
       const outcome = await plugin.auth.checkin(async () => sessionAuth())
       assert.equal(outcome.outcome, "captcha")
-      assert.match(outcome.message, /验证题|合理范围/)
+      assert.match(outcome.message, /验证码|控制台/)
       assert.deepEqual(calls.map((call) => new URL(call.url).pathname), [
         BAIZHI.walletBalancePath,
-        "/api/v1/public/captcha/challenge",
+        DAILY_CREDIT_PATH,
       ])
     },
   )
@@ -316,8 +314,7 @@ test("每日积分：同账号两个并发 checkin 单飞，只跑一条领取�
       { outcome: "claimed", credit: 100, message: "每日积分领取成功 +100 积分" },
     ])
     assert.equal(claimCount, 1)
-    assert.equal(calls.filter((call) => call.url.includes("/captcha/challenge")).length, 1)
-    assert.equal(calls.filter((call) => call.url.includes("/captcha/redeem")).length, 1)
+    assert.equal(calls.filter((call) => new URL(call.url).pathname === DAILY_CREDIT_PATH).length, 1)
     assert.equal(calls.filter((call) => new URL(call.url).pathname === BAIZHI.walletBalancePath).length, 2)
   })
 })

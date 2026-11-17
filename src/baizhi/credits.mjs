@@ -6,10 +6,10 @@
 // 没有 cookie 时推理照常，只是查不到积分 —— 必须优雅降级，不能把账号判死。
 
 import {
-  cookieOf, platformRequest, readArrayField, readBoolField, readNumber, readNumberField, unwrapEnvelope,
+  cookieOf, platformRequest, readArrayField, readBoolField, readNumberField, unwrapEnvelope,
   UA,
 } from "../platform-http.mjs"
-import { solveChallengeYielding } from "../monkeycode/credits.mjs"
+import { buildInteraction } from "./interaction.mjs"
 
 /** 钱包读数（已从「分」换算成积分）。 */
 export async function fetchWallet(cookie, site, { fetchImpl = fetch, timeoutMs = 10_000 } = {}) {
@@ -45,43 +45,16 @@ export async function fetchWallet(cookie, site, { fetchImpl = fetch, timeoutMs =
   }
 }
 
-/** 读每日积分验证题（`{ token, challenge: { c, s, d } }`）。 */
-function readChallenge(data) {
-  if (data === null || typeof data !== "object") {
-    return { error: "每日积分验证题报文不是对象（上游形态可能已变）" }
-  }
-  const token = typeof data.token === "string" ? data.token.trim() : ""
-  if (token.length === 0) return { error: "每日积分验证题报文里没有 token（上游形态可能已变）" }
-  const challenge = data.challenge
-  if (challenge === null || typeof challenge !== "object") {
-    return { error: "每日积分验证题报文里没有 challenge（上游形态可能已变）" }
-  }
-  const count = readNumber(challenge.c)
-  const saltLength = readNumber(challenge.s)
-  const targetLength = readNumber(challenge.d)
-  if (count === undefined || saltLength === undefined || targetLength === undefined) {
-    return { error: "每日积分验证题的 c/s/d 字段缺失或不是数字（上游形态可能已变）" }
-  }
-  // 与 MonkeyCode 同一套 PoW；限制计算量，避免异常题面冻结宿主。
-  if (count < 1 || count > 500 || saltLength < 1 || saltLength > 256 || targetLength < 1 || targetLength > 16) {
-    return { error: `每日积分验证题参数超出合理范围（c=${count}, s=${saltLength}, d=${targetLength}）` }
-  }
-  return { token, challenge: { count: Math.floor(count), saltLength: Math.floor(saltLength), targetLength: Math.floor(targetLength) } }
-}
-
-/** 从 redeem 响应里取 captcha token。 */
-function readCaptchaToken(data) {
-  if (data === null || typeof data !== "object" || data.success === false) return undefined
-  const token = typeof data.token === "string" ? data.token.trim() : ""
-  return token.length === 0 ? undefined : token
-}
-
 /**
- * 领取每日积分：钱包幂等状态 → challenge → 本地 PoW → redeem → daily-temporary-credit。
+ * 领取每日积分：钱包幂等状态 → 加密行为快照 → daily-temporary-credit。
+ *
+ * 控制台把行为快照（interaction）随领取请求一起提交，服务端据此判定是浏览器调用；
+ * 只发 captcha_token 会被要求图片验证码。这里用控制台同样的密钥/AAD 和一份真实
+ * 快照重建 interaction，每次换新 IV。
  *
  * 已领取 / 领取前钱包失败时绝不发 POST。`claimed:false` 是并发下另一会话已领取的
- * 幂等结果，不是失败。实际到账只认领取前后 `temporary_credit_cents` 的正差额；
- * 上游报文没有金额、复读钱包失败或没有正差额时，只报告通用成功，不硬编码 100。
+ * 幂等结果，不是失败。若上游仍要求图片验证码，如实报 captcha，让用户去控制台领。
+ * 实际到账只认领取前后 `temporary_credit_cents` 的正差额；不硬编码 100。
  */
 export async function claimDailyCredit(credential, site, { fetchImpl = fetch, timeoutMs = 10_000 } = {}) {
   const cookie = cookieOf(credential, site.sessionCookies, site.sessionCookie)
@@ -99,46 +72,33 @@ export async function claimDailyCredit(credential, site, { fetchImpl = fetch, ti
       return { kind: "already-claimed", message: "今日已领取" }
     }
 
-    const challengeResult = await platformRequest(
-      cookie,
-      `${base}/api/v1/public/captcha/challenge`,
-      { method: "POST", body: {}, fetchImpl, timeoutMs },
-    )
-    if (!challengeResult.ok) return { kind: "failed", message: `获取每日积分验证题失败：${challengeResult.error}` }
-    const challengeEnvelope = unwrapEnvelope(challengeResult.data)
-    if (!challengeEnvelope.ok) return { kind: "failed", message: `获取每日积分验证题失败：${challengeEnvelope.error}` }
-    const challenge = readChallenge(challengeEnvelope.value)
-    if ("error" in challenge) return { kind: "captcha", message: challenge.error }
-
-    let solutions
+    // The console sends an encrypted behaviour snapshot (`interaction`) with
+    // the claim. Without it the service answers with an image captcha the
+    // plugin cannot solve. Build the same payload and submit it directly.
+    let interaction
     try {
-      solutions = await solveChallengeYielding(challenge.token, challenge.challenge)
+      interaction = await buildInteraction()
     } catch (error) {
-      return { kind: "captcha", message: error instanceof Error ? error.message : String(error) }
-    }
-
-    const redeemResult = await platformRequest(
-      cookie,
-      `${base}/api/v1/public/captcha/redeem`,
-      { method: "POST", body: { token: challenge.token, solutions }, fetchImpl, timeoutMs },
-    )
-    if (!redeemResult.ok) return { kind: "failed", message: `提交每日积分验证答案失败：${redeemResult.error}` }
-    const redeemEnvelope = unwrapEnvelope(redeemResult.data)
-    if (!redeemEnvelope.ok) return { kind: "failed", message: `提交每日积分验证答案失败：${redeemEnvelope.error}` }
-    const captchaToken = readCaptchaToken(redeemEnvelope.value)
-    if (captchaToken === undefined) {
-      return { kind: "captcha", message: "每日积分验证没有通过（redeem 响应里没有 token），请重试一次" }
+      return { kind: "failed", message: `构造签到验证数据失败：${error instanceof Error ? error.message : String(error)}` }
     }
 
     const claimResult = await platformRequest(
       cookie,
       `${base}/api/v1/user/wallet/daily-temporary-credit`,
-      { method: "POST", body: { captcha_token: captchaToken }, fetchImpl, timeoutMs },
+      { method: "POST", body: { interaction }, fetchImpl, timeoutMs },
     )
     if (!claimResult.ok) return { kind: "failed", message: `领取每日积分失败：${claimResult.error}` }
     const claimEnvelope = unwrapEnvelope(claimResult.data)
     if (!claimEnvelope.ok) return { kind: "failed", message: `领取每日积分失败：${claimEnvelope.error}` }
-    const claimed = readBoolField(claimEnvelope.value, "claimed")
+    const value = claimEnvelope.value
+
+    // A stale or rejected interaction still gets an image captcha. Report it
+    // honestly so the card asks the user to claim in the console instead of
+    // showing a false success.
+    if (value && value.captcha_required === true) {
+      return { kind: "captcha", message: "平台要求图片验证码，请到百智云控制台手动领取今日积分" }
+    }
+    const claimed = readBoolField(value, "claimed")
     if (claimed === false) return { kind: "already-claimed", message: "今日已领取" }
     if (claimed !== true) {
       return { kind: "failed", message: "领取每日积分的响应里没有明确的 claimed 布尔值（上游形态可能已变）" }
