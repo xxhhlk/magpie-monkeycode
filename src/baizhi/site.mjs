@@ -42,7 +42,9 @@ export const BAIZHI_KNOWN_MODELS = Object.freeze([
   { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", context: BAIZHI_MAX_CONTEXT },
   { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", context: BAIZHI_MAX_CONTEXT },
   { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek V4 Flash Vision (exp)", context: BAIZHI_MAX_CONTEXT, image: true },
-  { id: "deepseek-flash", name: "DeepSeek Flash", context: BAIZHI_MAX_CONTEXT },
+  // 2026-11-22 实测支持图片（纯色图三色识别全对，网关回 model=deepseek-v4.1-flash-1017）；
+  // 控制台 /api/console/models 把它列成 input:['text']，那份元数据没跟上后端，以实测为准。
+  { id: "deepseek-flash", name: "DeepSeek Flash", context: BAIZHI_MAX_CONTEXT, image: true },
   { id: "minimax-m2.7", name: "MiniMax M2.7", image: true },
   { id: "minimax-m2.5", name: "MiniMax M2.5" },
   { id: "glm-5.1", name: "GLM-5.1", image: true },

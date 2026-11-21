@@ -377,6 +377,7 @@ test("已知能力表：只有 4 条 deepseek 声明窗口，图片只给明确�
   assert.equal(deepseek.length, 4)
   assert.ok(deepseek.every((model) => model.id.startsWith("deepseek-")))
   assert.equal(knownBaizhiModel("deepseek-v4-flash-vision-exp").image, true)
+  assert.equal(knownBaizhiModel("deepseek-flash").image, true, "2026-11-22 实测三色识别全对")
   assert.equal(knownBaizhiModel("glm-5").image, undefined, "不知道就不写，不是写 false")
 })
 
